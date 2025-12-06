@@ -20,6 +20,7 @@
 #include "CorrectPhi.H"
 #include "fvcSmooth.H"
 #include "dynamicRefineFvMesh.H"
+#include "cellQuality.H"
 
 ///
 // --- Timing support (v2412 compatible)
