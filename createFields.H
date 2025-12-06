@@ -133,3 +133,23 @@ mesh.setFluxRequired(alpha1.name());
 #include "createPorosity.H"
 
 isoAdvection advector(alpha1, phi, U);
+
+// GNN output control
+bool writePressureSystem = false;
+label gnnWriteInterval = 1;
+
+{
+    const dictionary& fvSolDict = mesh.solutionDict();
+    if (fvSolDict.found("gnnOutput"))
+    {
+        const dictionary& gnnDict = fvSolDict.subDict("gnnOutput");
+        writePressureSystem = gnnDict.lookupOrDefault<bool>("writePressureSystem", false);
+        gnnWriteInterval = gnnDict.lookupOrDefault<label>("writeInterval", 1);
+
+        if (writePressureSystem)
+        {
+            Info<< "GNN output enabled: writing every " << gnnWriteInterval
+                << " time steps to gnn/ directory" << nl;
+        }
+    }
+}
