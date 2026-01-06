@@ -43,6 +43,7 @@
         p_rghEqn.setReference(pRefCell, getRefCellValue(p_rgh, pRefCell));
 
         // ===== GNN Output Section =====
+        // Output preconditioned matrix A, RHS b, solution x, and residual r
         const bool doGnnWrite =
             writePressureSystem
          && pimple.finalNonOrthogonalIter()
@@ -345,7 +346,9 @@
             }
 
             // ---------------------------------------------------------
-            // 6) CSR format output for matrix A
+            // 6) CSR format output for PRECONDITIONED matrix A
+            //    Preconditioner: Diagonal scaling (Jacobi)
+            //    A_precond[i][j] = A[i][j] / diag[i]
             // ---------------------------------------------------------
             {
                 const label nRows = nCells;
@@ -353,6 +356,8 @@
                 fileName csrName(outDir/("A_csr_" + runTime.timeName() + "_rank" + Foam::name(Pstream::myProcNo()) + ".dat"));
                 OFstream osCsr(csrName);
 
+                osCsr << "# Preconditioned matrix (Jacobi/diagonal scaling)\n";
+                osCsr << "# A_precond[i][j] = A[i][j] / diag[i]\n";
                 osCsr << "nRows " << nRows << '\n'
                       << "nCols " << nRows << '\n'
                       << "nnz "   << nnz   << '\n';
@@ -383,11 +388,14 @@
 
                 List<label> rowPos(rowPtr);
 
+                // Apply diagonal scaling (Jacobi preconditioner)
+                // A_precond[i][j] = A[i][j] / diag[i]
                 for (label i = 0; i < nRows; ++i)
                 {
                     const label idx = rowPos[i]++;
                     colInd[idx] = i;
-                    val[idx]    = diag[i];
+                    // Diagonal element after preconditioning: diag[i]/diag[i] = 1.0
+                    val[idx]    = 1.0;
                 }
 
                 for (label f = 0; f < nFaces; ++f)
@@ -395,16 +403,18 @@
                     const label own = lowerAddr[f];
                     const label nei = upperAddr[f];
 
+                    // A[own][nei] = upper[f] -> A_precond[own][nei] = upper[f]/diag[own]
                     {
                         const label idx = rowPos[own]++;
                         colInd[idx] = nei;
-                        val[idx]    = upper[f];
+                        val[idx]    = upper[f] / (diag[own] + VSMALL);
                     }
 
+                    // A[nei][own] = lower[f] -> A_precond[nei][own] = lower[f]/diag[nei]
                     {
                         const label idx = rowPos[nei]++;
                         colInd[idx] = own;
-                        val[idx]    = lower[f];
+                        val[idx]    = lower[f] / (diag[nei] + VSMALL);
                     }
                 }
 
@@ -420,19 +430,43 @@
                     osCsr << val[k] << (k+1 < nnz ? ' ' : '\n');
                 }
             }
+
+            // ---------------------------------------------------------
+            // 7) Output preconditioned RHS vector b
+            //    b_precond[i] = b[i] / diag[i]
+            // ---------------------------------------------------------
+            {
+                fileName bName(outDir/("b_" + runTime.timeName() + "_rank" + Foam::name(Pstream::myProcNo()) + ".dat"));
+                OFstream osB(bName);
+
+                osB << "# Preconditioned RHS vector (Jacobi/diagonal scaling)\n";
+                osB << "# b_precond[i] = b[i] / diag[i]\n";
+                osB << "nCells " << nCells << '\n';
+
+                for (label i = 0; i < nCells; ++i)
+                {
+                    const scalar b_precond = b[i] / (diag[i] + VSMALL);
+                    osB << i << ' ' << b_precond << '\n';
+                }
+            }
         } // if (doGnnWrite)
 
         // Solve
         p_rghEqn.solve();
 
-        // Output solution vector x and true residual r = Ax - b
+        // ---------------------------------------------------------
+        // Output solution vector x (pressure at time n+1) and residual r
+        // ---------------------------------------------------------
         if (doGnnWrite)
         {
             const scalarField& x = p_rgh.internalField();
-            const scalarField& b = p_rghEqn.source();
+            const scalarField& b_src = p_rghEqn.source();
+            const scalarField& diagVals = p_rghEqn.diag();
             const label nCells = mesh.nCells();
 
-            // Output x
+            // ---------------------------------------------------------
+            // 8) Output solution x (pressure at time n+1)
+            // ---------------------------------------------------------
             {
                 fileName outDir(runTime.path()/"gnn");
                 mkDir(outDir);
@@ -449,13 +483,18 @@
 
                 OFstream osX(outName);
 
+                osX << "# Solution vector x (pressure p_rgh at time n+1)\n";
+                osX << "nCells " << nCells << '\n';
+
                 for (label i=0; i<nCells; ++i)
                 {
                     osX << i << ' ' << x[i] << '\n';
                 }
             }
 
-            // Get true residual using fvScalarMatrix::residual()
+            // ---------------------------------------------------------
+            // 9) Get and output residual r = Ax - b
+            // ---------------------------------------------------------
             tmp<scalarField> tR = p_rghEqn.residual();
             const scalarField& r = tR();
 
@@ -463,31 +502,39 @@
             scalar sumB2  = 0.0;
             scalar sumAx2 = 0.0;
             scalar maxAbsR = 0.0;
+            scalar sumRprecond2 = 0.0;
 
             for (label i=0; i<nCells; ++i)
             {
                 const scalar ri = r[i];
-                const scalar bi = b[i];
+                const scalar bi = b_src[i];
                 const scalar Axi = ri + bi;
+                const scalar di = diagVals[i];
 
                 sumR2  += ri*ri;
                 sumB2  += bi*bi;
                 sumAx2 += Axi*Axi;
                 maxAbsR = Foam::max(maxAbsR, Foam::mag(ri));
+
+                // Preconditioned residual: r_precond[i] = r[i] / diag[i]
+                const scalar ri_precond = ri / (di + VSMALL);
+                sumRprecond2 += ri_precond*ri_precond;
             }
 
             const scalar normR  = Foam::sqrt(sumR2);
             const scalar normB  = Foam::sqrt(sumB2) + SMALL;
             const scalar normAx = Foam::sqrt(sumAx2) + SMALL;
+            const scalar normRprecond = Foam::sqrt(sumRprecond2);
 
-            Info<< "pEqn true(Ax-b) via residual(): "
+            Info<< "pEqn residual (Ax-b): "
                 << "||r||_2="        << normR
                 << ", max|r_i|="     << maxAbsR
                 << ", ||r||/||b||="  << normR/normB
                 << ", ||r||/||Ax||=" << normR/normAx
+                << ", ||r_precond||_2=" << normRprecond
                 << nl;
 
-            // Output per-cell residual
+            // Output per-cell residual (both original and preconditioned)
             {
                 fileName outDir(runTime.path()/"gnn");
                 mkDir(outDir);
@@ -495,7 +542,7 @@
                 (
                     outDir
                   / (
-                        "rTrue_"
+                        "r_"
                       + runTime.timeName()
                       + "_rank" + Foam::name(Pstream::myProcNo())
                       + ".dat"
@@ -504,9 +551,17 @@
 
                 OFstream osR(rName);
 
+                osR << "# Residual r = Ax - b\n";
+                osR << "# Columns: cellIndex  r[i]  r_precond[i]\n";
+                osR << "# r_precond[i] = r[i] / diag[i] (Jacobi preconditioned)\n";
+                osR << "nCells " << nCells << '\n';
+
                 for (label i=0; i<nCells; ++i)
                 {
-                    osR << i << ' ' << r[i] << '\n';
+                    const scalar ri = r[i];
+                    const scalar di = diagVals[i];
+                    const scalar ri_precond = ri / (di + VSMALL);
+                    osR << i << ' ' << ri << ' ' << ri_precond << '\n';
                 }
             }
         }
